@@ -1,0 +1,935 @@
+! Explicit user subroutine in Abaqus for phase field method    
+C***********************************************************************
+C
+C     Common variable module, which defines some common variables 
+C     and allocates memory
+C
+C***********************************************************************      
+      
+      module vars_module
+        parameter (NodeNum = 4, NumEle=1, NPT=4)
+        real*8,save :: allD(NodeNum), allH(NumEle), allDP(NumEle)
+        real*8,save :: allH_glo(NumEle),allD_glo(NodeNum)
+        integer, save :: NUMPROCESSES = 1
+      end module
+C***********************************************************************
+C
+C     VUMAT subroutine interface
+C
+C***********************************************************************       
+
+      subroutine vumat(
+     1  nblock, ndir, nshr, nstatev, nfieldv, nprops, lanneal,
+     2  stepTime, totalTime, dt, cmname, coordMp, charLength,
+     3  props, density, strainInc, relSpinInc,
+     4  tempOld, stretchOld, defgradOld, fieldOld,
+     5  stressOld, stateOld, enerInternOld, enerInelasOld,
+     6  tempNew, stretchNew, defgradNew, fieldNew,
+     7  stressNew, stateNew, enerInternNew, enerInelasNew )
+C
+      include 'vaba_param.inc'
+C
+      dimension props(nprops), density(nblock), coordMp(nblock,*),
+     1  charLength(nblock), strainInc(nblock,ndir+nshr),
+     2  relSpinInc(nblock,nshr), tempOld(nblock),
+     3  stretchOld(nblock,ndir+nshr),
+     4  defgradOld(nblock,ndir+nshr+nshr),
+     5  fieldOld(nblock,nfieldv), stressOld(nblock,ndir+nshr),
+     6  stateOld(nblock,nstatev), enerInternOld(nblock),
+     7  enerInelasOld(nblock), tempNew(nblock),
+     8  stretchNew(nblock,ndir+nshr),
+     8  defgradNew(nblock,ndir+nshr+nshr),
+     9  fieldNew(nblock,nfieldv),
+     1  stressNew(nblock,ndir+nshr), stateNew(nblock,nstatev),
+     2  enerInternNew(nblock), enerInelasNew(nblock)
+C
+      character*80 cmname
+!
+!      Call another specific VUMAT subroutine
+!
+      call vumat_pfm_elas(
+     1  nblock, ndir, nshr, nstatev, nfieldv, nprops, lanneal,
+     2  stepTime, totalTime, dt, cmname, coordMp, charLength,
+     3  props, density, strainInc, relSpinInc,
+     4  tempOld, stretchOld, defgradOld, fieldOld,
+     5  stressOld, stateOld, enerInternOld, enerInelasOld,
+     6  tempNew, stretchNew, defgradNew, fieldNew,
+     7  stressNew, stateNew, enerInternNew, enerInelasNew )
+
+      return
+      end subroutine
+
+
+C***********************************************************************
+C
+C    VUMAT user subroutine, including stress reduction 
+C    and strain energy calculation.
+C
+C*********************************************************************** 
+      subroutine vumat_pfm_elas(
+     1  nblock, ndir, nshr, nstatev, nfieldv, nprops, lanneal,
+     2  stepTime, totalTime, dt, cmname, coordMp, charLength,
+     3  props, density, strainInc, relSpinInc,
+     4  tempOld, stretchOld, defgradOld, fieldOld,
+     5  stressOld, stateOld, enerInternOld, enerInelasOld,
+     6  tempNew, stretchNew, defgradNew, fieldNew,
+     7  stressNew, stateNew, enerInternNew, enerInelasNew )
+C
+      include 'vaba_param.inc'
+C
+      dimension props(nprops), density(nblock), coordMp(nblock,*),
+     1  charLength(nblock), strainInc(nblock,ndir+nshr),
+     2  relSpinInc(nblock,nshr), tempOld(nblock),
+     3  stretchOld(nblock,ndir+nshr),
+     4  defgradOld(nblock,ndir+nshr+nshr),
+     5  fieldOld(nblock,nfieldv), stressOld(nblock,ndir+nshr),
+     6  stateOld(nblock,nstatev), enerInternOld(nblock),
+     7  enerInelasOld(nblock), tempNew(nblock),
+     8  stretchNew(nblock,ndir+nshr),
+     8  defgradNew(nblock,ndir+nshr+nshr),
+     9  fieldNew(nblock,nfieldv),
+     1  stressNew(nblock,ndir+nshr), stateNew(nblock,nstatev),
+     2  enerInternNew(nblock), enerInelasNew(nblock)
+C
+      character*80 cmname
+c
+C    local variables
+C      
+      parameter ( zero = 0.d0, one = 1.d0, two = 2.d0,d_thresh = 0.99d0,
+     *     third = 1.d0 / 3.d0, half = 0.5d0, op5 = 1.5d0)
+	 
+      parameter (nblkLocal = 136)
+      dimension e_voigt(6),e_tensor(3,3),e_prin(3),e_dir(3,3)
+      dimension alphai(3)
+      dimension s_tensor(3,3), s_prin(3,3)
+      real*8  lc,lb, Gf, ea, ft,xnu
+      real*8  p, a1, a2, a3, e_tr
+      real*8  phase, dalpha, dphase
+      real*8  omega,domega,phie
+      real*8  hist, hist_threshold
+      real*8  c0
+*
+* --- exit if nblkLocal is smaller than nblock
+*	  
+      if (nblkLocal .lt. nblock) then
+        call xplb_abqerr (-2,'Change nblkLocal to be greater '//
+     *       'than or equal to %i',nblock,zero,' ')
+        call xplb_exit
+      end if
+c
+c    Material parameters
+c
+      ea = props(1)
+      xnu = props(2)
+	  ft = props(3)
+	  Gf = props(4)
+	  lb = props(5)
+      twomu  = ea / ( one + xnu )
+      alamda = xnu * twomu / ( one - two * xnu )
+	  c0   =  3.1415926535897932384626433832d0
+c 
+c     初始平面应力单元 
+c
+      if ( stepTime .eq. zero ) then
+        do k = 1, nblock
+          trace = strainInc(k,1) + strainInc(k,2) + strainInc(k,3)  !
+          stressNew(k,1) = stressOld(k,1) + twomu * strainInc(k,1) + alamda * trace !x方向应力
+          stressNew(k,2) = stressOld(k,2) + twomu * strainInc(k,2) + alamda * trace !y方向应力
+          stressNew(k,3) = stressOld(k,3) + twomu * strainInc(k,3) + alamda * trace !z方向应力
+		  stressNew(k,4) = stressOld(k,4) + twomu * strainInc(k,4) !xy方向剪应力
+        end do
+		return
+	  end if
+	  !print*,'stressNew=',stressNew
+c 
+c     
+c		
+      if ( stepTime .gt. zero ) then
+        do i = 1, nblock
+          a1   =  4.d0/(c0*lb)*ea*Gf/(ft*ft)
+		  !print*,'a1=',a1
+*         concrete softening
+          p  =  2.0d0
+          a2 =  1.3868d0
+          a3 =  0.6567d0
+c         弹性应变
+          stateNew(i,1) = stateOld(i,1) + strainInc(i,1)  !储存x方向应变值
+          stateNew(i,2) = stateOld(i,2) + strainInc(i,2)  !储存y方向应变值
+		  stateNew(i,3) = stateOld(i,3) + strainInc(i,3)  !储存z方向应变值
+          stateNew(i,4) = stateOld(i,4) + strainInc(i,4)  !储存xy方向剪切应变值	
+          stateNew(i,5)	= 0.0d0	
+          stateNew(i,6)	= 0.0d0	
+c		  应力应变特征值求解  
+          e_voigt = stateNew(i,1:6)
+c         The transformation of elastic strain from Voigt form to tensor form          
+          call voigt_convection(e_voigt, e_tensor,.false.,.true.)
+c         Eigenvalue decomposition of strain
+          call eigen3D(e_tensor, e_prin, e_dir)
+c         谱分解
+          print*,'e_prin=',e_prin
+          e_tr   = e_prin(1) + e_prin(2) + e_prin(3)
+          e1plus = max(e_prin(1),0.0d0)
+          e2plus = max(e_prin(2),0.0d0)
+          e3plus = max(e_prin(3),0.0d0)      
+c         驱动力求解        
+          phie = half*(alamda*e_tr**two 
+     1           + twomu*(e1plus**two + e2plus**two + e3plus**two) )
+	      print*,'phie=',phie 
+c         名义应力求解	  
+		  call energeticFunc(omega,domega,phase,a1,a2,a3,p)
+		  print*,'omega=',omega
+          do k=1,3
+              alphai(k) = zero
+              if (e_prin(k) .gt. zero) alphai(k)=one
+          end do
+          alpha = one		  
+          if (e_prin(1) .gt. 0.0d0) then
+              sigma1 =  twomu * e_prin(1) * omega
+     1            + alamda * e_tr * omega
+          else 
+               sigma1 =  twomu * e_prin(1) 
+     1            + alamda * e_tr 
+          end if
+c          
+          if (e_prin(2) .gt. 0.0d0) then
+              sigma2 =  twomu * e_prin(2) * omega
+     1            + alamda * e_tr * omega
+          else 
+               sigma2 =  twomu * e_prin(2) 
+     1            + alamda * e_tr 
+          end if
+          s_prin = 0.d0
+          s_prin(1,1) = sigma1
+          s_prin(2,2) = sigma2
+          s_prin(3,3) = sigma3
+		  
+          s_tensor = matmul(matmul(e_dir,s_prin),transpose(e_dir))
+          call voigt_convection(stressNew(i,:), s_tensor,.true.,.true.)		  
+          
+		  stressNew(i,1) = stressNew(i,1)
+          stressNew(i,2) = stressNew(i,2)
+          stressNew(i,3) = 0.0d0
+          stressNew(i,4) = stressNew(i,4)
+          stressNew(i,5) = 0.0d0
+          stressNew(i,6) = 0.0d0
+c		  变量更新
+		  stateNew(i,7) = sigma1
+          stateNew(i,8) = sigma2
+          stateNew(i,9) = phie
+		  stateNew(i,10) =  omega
+          print*,'stateNew(i,11) = ',stateNew(i,9)		  
+		  stateNew(i,11) = max( stateOld(i,11), stateNew(i,9) ) ! H
+          stateNew(i,12) = fieldOLd(i,1)  ! d
+		  print*,'stateNew(i,14) = ',stateNew(i,11)
+		  print*,'stateNew(i,15) = ',stateNew(i,12)
+		  !print*,'stateNew=',stateNew
+		end do 
+      end if
+
+      return
+      end subroutine 
+          
+
+C***********************************************************************
+C
+C     VUEL for crack propagation by PFM
+C     doF 11 represent the phase d
+C
+C***********************************************************************
+      subroutine vuel(
+     *     nblock,
+c          to be defined
+     *     rhs,amass,dtimeStable,
+     *     svars,nsvars,
+     *     energy,
+c          read only
+     *     nnode,ndofel,
+     *     props,nprops,
+     *     jprops,njprops,
+     *     coords,ncrd,
+     *     u,du,v,a,
+     *     jtype,jelem,
+     *     time,period,dtimeCur,dtimePrev,kstep,kinc,lflags,
+     *     dMassScaleFactor,
+     *     predef,npredef,
+     *     jdltyp,adlmag)
+
+      use vars_module
+C     
+      include 'vaba_param.inc'
+
+      parameter ( zero = 0.d0, half = 0.5d0, one = 1.d0, two=2.d0 )
+      parameter (scaleTemp = 0.9d0)
+
+c     operation code
+      parameter ( jMassCalc            = 1,
+     *            jIntForceAndDtStable = 2,
+     *            jExternForce         = 3)
+
+c     flags
+      parameter (iProcedure = 1,
+     *           iNlgeom    = 2,
+     *           iOpCode    = 3,
+     *           nFlags     = 3)
+
+c     time
+      parameter (iStepTime  = 1,
+     *           iTotalTime = 2,
+     *           nTime      = 2)
+
+c     procedure flags
+      parameter ( jDynExplicit = 17 )
+
+c     energies 
+      parameter ( iElPd = 1,
+     *            iElCd = 2,
+     *            iElIe = 3,
+     *            iElTs = 4,
+     *            iElDd = 5,
+     *            iElBv = 6,
+     *            iElDe = 7,
+     *            iElHe = 8,
+     *            iElKe = 9,
+     *            iElTh = 10,
+     *            iElDmd = 11,
+     *            iElDc = 12,
+     *            nElEnergy = 12)
+
+
+c     predefined variables
+      parameter ( iPredValueNew = 1,
+     *            iPredValueOld = 2,
+     *            nPred         = 2)    
+
+      parameter (factorStable = 0.99d0)
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+c
+      dimension rhs(nblock,ndofel), amass(nblock,ndofel,ndofel),
+     *     dtimeStable(nblock),
+     *     svars(nblock,nsvars), energy(nblock,nElEnergy),
+     *     props(nprops), jprops(njprops),
+     *     jelem(nblock), time(nTime), lflags(nFlags),
+     *     coords(nblock,nnode,ncrd), u(nblock,ndofel),
+     *     du(nblock,ndofel), v(nblock,ndofel), a(nblock, ndofel),
+     *     dMassScaleFactor(nblock),
+     *     predef(nblock, nnode, npredef, nPred), adlmag(nblock)
+      
+!     Declaration of variables for user element
+*
+      dimension UD(4),DUD(4)
+*
+      integer i,j,k
+      integer ngp,kblock
+*      
+      real*8  lc,lb, Gf, ea, ft ,thk,etaa
+      real*8  p, a1, a2, a3
+      real*8  phase, dalpha, dphase
+      real*8  omega,domega,eta,xi
+      real*8  hist,phi_source
+      real*8  c0,dvol,det_jacb
+      
+      parameter (ngp = 2)
+      
+      dimension gp(ngp), gw(ngp)
+      dimension bd(2,4), dinv_jacb(2,2) 
+      dimension coords_ele(2, 4),djacb(2,2)
+      dimension shN(4), dn_xieta(2,4), dn_x(4), dn_y(4)
+      dimension rd(4),rq(4),ID(4)
+	  data ID/1,2,3,4/
+C      
+C     ================================================================================================     
+C     parameter initilization
+C
+      ea   =  props(1)      ! props(1) -- Young's modulus
+      ft   =  props(2)      ! props(2) -- failure strength
+      Gf   =  props(3)      ! props(3) -- fracture energy
+      lb   =  props(4)      ! props(4) -- length scale 
+      etaa = props(5)       ! props(5) -- 率相关值   
+      thk  =  props(6)      ! props(6) -- thickness
+c
+      c0   =  3.1415926535897932384626433832d0
+c
+      WF = Gf/2.0d0/lb      
+      WO = zero
+	  gp(1) = 0.d0
+	  gp(2) = 0.d0
+!     begin the VUEL      
+      if (jtype .eq. 2) then        
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+c                     -----------mass------------
+c
+         if ( lflags(iOpCode).eq.jMassCalc ) then
+           do kblock=1,nblock           
+             amass(kblock,1,1)= etaa *10.0d0
+			 amass(kblock,2,2)= etaa *10.0d0
+			 amass(kblock,3,3)= etaa *10.0d0
+			 amass(kblock,4,4)= etaa *10.0d0
+           enddo
+C          !print*,'amass=',amass  
+ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+c                         --------rhs----------
+c   
+         else if ( lflags(iOpCode) == jIntForceAndDtStable) then
+                
+           do kblock = 1,nblock
+              a1   =  4.d0/(c0*lb)*ea*Gf/(ft*ft)
+C             concrete softening
+              p  =  2.0d0
+              a2 =  1.3868d0
+              a3 =  0.6567d0				
+*         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~     *          
+*             coords_ele(ncrd, nnode) = coords(kblock,nnode,ncrd)
+*             nnode = 4; ncrd = 2
+              coords_ele(1, 1) = coords(kblock,1,1)
+              coords_ele(2, 1) = coords(kblock,1,2)
+              coords_ele(1, 2) = coords(kblock,2,1)
+              coords_ele(2, 2) = coords(kblock,2,2)
+              coords_ele(1, 3) = coords(kblock,3,1)
+              coords_ele(2, 3) = coords(kblock,3,2)
+              coords_ele(1, 4) = coords(kblock,4,1)
+              coords_ele(2, 4) = coords(kblock,4,2)
+				!print*,'e_coord=',e_coord
+              do i = 1, nnode
+                UD(i)  = U(kblock,i)
+                DUD(i) = DU(kblock,i) 
+              end do
+              print*,'UD=',UD
+			  print*,'DUD=',DUD
+              hist = allH(jelem(kblock)- NumEle)
+              !print*,'hist=',hist
+			  print*,'jelem(kblock)=',jelem(kblock)
+			  print*,'NumEle=',NumEle
+			  print*,'allH_glo=',allH_glo
+              if(hist .lt. zero)  hist = zero
+			  
+              call geometricFunc(dalpha,0.0d0) 
+              call energeticFunc(omega,domega,0.0d0,a1,a2,a3,p)  
+              hist_0 = - Gf * dalpha / domega / c0 / lb
+              !print*,'hist_0=',hist_0
+              hist = max(hist, hist_0)
+              print*,'hist=',hist
+c
+              do i =1,4
+                rd(i) = 0.d0
+			    rq(i) = 0.d0
+			  end do
+*         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~     *          
+              do i = 1, ngp
+                do j = 1, ngp
+                  xi = gp(i)  
+                  eta = gp(j)
+                  call b_matrix(shN,bd,det_jacb,coords_ele,xi,eta)
+*                 
+                  phase  = dot_product(shN,UD)                  
+                  
+                  call geometricFunc(dalpha,phase)                                ! geometric function
+                  call energeticFunc(omega,domega,phase,a1,a2,a3,p)               ! energetic function
+*
+                  phi_source  = domega *  hist + Gf/(c0*lb)*dalpha
+                  !print*,'phi_source=',phi_source
+				  !print*,'dalpha=',dalpha
+				  !print*,'omega=',omega
+				  !print*,'domega=',domega
+                  dvol=  1.d0*det_jacb*thk
+				  !print*,'det_jacb=',det_jacb
+				  !print*,'dvol=',dvol
+                  rq = matmul(transpose(bd),matmul(bd,UD))
+				  print*,'rq=',rq
+                  rd(1) = rd(1) - dvol*(phi_source*shN(1) + 2.d0*lb*Gf/c0*rq(1))
+                  rd(2) = rd(2) - dvol*(phi_source*shN(2) + 2.d0*lb*Gf/c0*rq(2))  
+                  rd(3) = rd(3) - dvol*(phi_source*shN(3) + 2.d0*lb*Gf/c0*rq(3))  
+                  rd(4) = rd(4) - dvol*(phi_source*shN(4) + 2.d0*lb*Gf/c0*rq(4)) 
+                  print*,'rd=',rd				  
+*
+                end do
+              end do	
+*
+              rhs(kblock,ID(1)) =  - rd(1)
+			  rhs(kblock,ID(2)) =  - rd(2)
+			  rhs(kblock,ID(3)) =  - rd(3)
+			  rhs(kblock,ID(4)) =  - rd(4)
+              if (hist .le. hist_0) then 
+                rhs(kblock,ID(1)) = 0.0d0
+				rhs(kblock,ID(2)) = 0.0d0
+				rhs(kblock,ID(3)) = 0.0d0
+				rhs(kblock,ID(4)) = 0.0d0
+              end if 
+              print*,'rhs=',rhs			  
+              dtimeStable(kblock) = factorStable*etaa/(500*(WF-WO))
+            end do 				
+        end if
+      end if
+c
+      return
+      end subroutine
+      
+c ----------------------------------------------------------------------
+C
+C User subroutine vufield
+C Transfer of phase field variable d between two models      
+C
+c ----------------------------------------------------------------------
+      subroutine VUField( 
+C Write only - 
+     *     rUserField, 
+C Read only - 
+     *     nBlock, nField, kField, nComp,
+     *     kStep, kInc, jNodeUid, time, 
+     *     coords, U, V, A )
+
+      use vars_module
+*
+      include 'vaba_param.inc'
+
+      dimension rUserField(nBlock,nComp,nField)
+      dimension JNodeUid(nBlock), time(4), coords(3,nBlock)
+      dimension U(8,nBlock), V(8,nBlock), A(8,nBlock)
+*
+      parameter ( i_ufld_Current   = 1, 
+     *            i_ufld_Increment = 2, 
+     *            i_ufld_Period    = 3, 
+     *            i_ufld_Total     = 4 )
+*
+      parameter ( i_ufld_CoordX = 1,
+     *            i_ufld_CoordY = 2,
+     *            i_ufld_CoordZ = 3 )
+*
+      parameter ( i_ufld_SpaDisplX = 1,
+     *            i_ufld_SpaDisplY = 2,
+     *            i_ufld_SpaDisplZ = 3,
+     *            i_ufld_RotDisplX = 4,
+     *            i_ufld_RotDisplY = 5,
+     *            i_ufld_RotDisplZ = 6, 
+     *            i_ufld_AcoPress  = 7,
+     *            i_ufld_Temp      = 8 )
+*
+      parameter ( i_ufld_SpaVelX   = 1,
+     *            i_ufld_SpaVelY   = 2,
+     *            i_ufld_SpaVelZ   = 3,
+     *            i_ufld_RotVelX   = 4,
+     *            i_ufld_RotVelY   = 5,
+     *            i_ufld_RotVelZ   = 6,
+     *            i_ufld_DAcoPress = 7,
+     *            i_ufld_DTemp     = 8 )
+*
+      parameter ( i_ufld_SpaAccelX  = 1,
+     *            i_ufld_SpaAccelY  = 2,
+     *            i_ufld_SpaAccelZ  = 3,
+     *            i_ufld_RotAccelX  = 4,
+     *            i_ufld_RotAccelY  = 5,
+     *            i_ufld_RotAccelZ  = 6, 
+     *            i_ufld_DDAcoPress = 7,
+     *            i_ufld_DDTemp     = 8 )
+
+      parameter (oneHundred = 100.d0, twoHundred = 200.d0)
+*
+      integer kComp,kNod
+      if (kField .eq. 1) then
+
+         do kComp = 1, nComp
+            do kNod = 1, nBlock
+                if(JNODEUID(kNod) > NodeNum)then
+                    allD(JNODEUID(kNod)-NodeNum) = U(i_ufld_Temp,kNod)
+                    rUserField(kNod,kComp,1) = U(i_ufld_Temp,kNod) 
+                else
+                    rUserField(kNod,kComp,1) = allD(JNODEUID(kNod))
+                end if
+            end do
+         end do
+         
+      end if
+*
+      return
+      end subroutine
+
+c ----------------------------------------------------------------------
+c
+c User subroutine VUSDFLD for user-defined fields
+C Phase field driving force between two models
+c
+c ----------------------------------------------------------------------
+      subroutine vusdfld(
+c Read only -
+     *   nblock, nstatev, nfieldv, nprops, ndir, nshr, 
+     *   jElemUid, kIntPt, kLayer, kSecPt, 
+     *   stepTime, totalTime, dt, cmname, 
+     *   coordMp, direct, T, charLength, props, 
+     *   stateOld, 
+c Write only -
+     *   stateNew, field )
+c
+      use vars_module
+      include 'vaba_param.inc'
+c
+      dimension props(nprops),
+     *          jElemUid(nblock), coordMp(nblock, *), 
+     *          direct(nblock, 3, 3), T(nblock,3,3), 
+     *          charLength(nblock),
+     *          stateOld(nblock, nstatev), 
+     *          stateNew(nblock, nstatev),
+     *          field(nblock, nfieldv)
+      character*80 cmname
+c
+      character*3 cData(maxblk)
+      dimension jData(maxblk)
+      dimension eqps(maxblk)
+c
+      parameter ( zero = 0.d0 )
+c
+      integer k
+      do k = 1, nblock
+        if(jElemUid(k) <= NumEle)then
+            allH(jElemUid(k)) = stateOld(k,11)  
+        end if
+      end do
+
+      do k = 1, nblock
+        if(jElemUid(k) <= NumEle)then
+            stateNew(k,12) = allDP(jElemUid(k))
+        end if
+      end do
+      return
+      end subroutine
+c ----------------------------------------------------------------------	  
+      subroutine energeticFunc(omega,domega,phase,a1,a2,a3,p)
+      use vars_module
+	  include 'vaba_param.inc'
+      
+      real*8 omega, domega, phase
+      real*8 fac1, dfac1, ddfac1, fac2, dfac2, ddfac2
+      real*8 p, a1, a2, a3
+	  
+      fac1    =  (1.d0 - phase)**p
+      dfac1   = - p*(1.d0 - phase)**(p - 1.d0) 
+      ddfac1  =  p*(p - 1.d0)*(1.d0 - phase)**(p - 2.d0)       
+      fac2   =  fac1   + a1*phase + a1*a2*phase**2.d0 + a1*a2*a3*phase**3.d0
+      dfac2  =  dfac1  + a1 + 2.d0*a1*a2*phase + 3.d0*a1*a2*a3*phase**2.d0
+      ddfac2  =  ddfac1 + 2.d0*a1*a2 + 6.d0*a1*a2*a3*phase      
+      omega   =  fac1/fac2        
+      domega  =  (dfac1*fac2  - fac1*dfac2)/(fac2**2.d0)
+	  return
+	  end subroutine energeticFunc
+c ----------------------------------------------------------------------	  
+      subroutine geometricFunc(dalpha,phase)
+	  use vars_module
+      include 'vaba_param.inc'      
+      real*8 phase,dalpha
+	  
+      dalpha  = 2.d0 - 2.d0 * phase
+	  
+	  return
+      end subroutine geometricFunc
+*     *************************************************************************************************
+*
+*     shape function 
+*     
+*     *************************************************************************************************
+*        
+      subroutine shapefuc(shN,dn_xieta, xi, eta)
+          
+      include 'vaba_param.inc'
+      dimension shN(4), dn_xieta(2,4) 
+	  real*8 xi,eta
+*     ================================================================================================     *
+      print*,'xi=',xi
+	  print*,'eta=',eta
+	  do i = 1,4
+		shN(i) = 0.d0
+      end do
+	  shN(1) = 0.25d0*(1.d0 - xi)*(1.d0 - eta)
+      shN(2) = 0.25d0*(1.d0 + xi)*(1.d0 - eta)
+      shN(3) = 0.25d0*(1.d0 + xi)*(1.d0 + eta)
+      shN(4) = 0.25d0*(1.d0 - xi)*(1.d0 + eta)
+	  !print*,'shN=',shN
+	  do i = 1,2
+	    do j = 1,4
+		  dn_xieta(i,j) = 0.d0
+	    end do
+      end do	  
+      dn_xieta(1,1) = -0.25d0*(1.d0 - eta)
+      dn_xieta(1,2) =  0.25d0*(1.d0 - eta)
+      dn_xieta(1,3) =  0.25d0*(1.d0 + eta)
+      dn_xieta(1,4) = -0.25d0*(1.d0 + eta)          
+      dn_xieta(2,1) = -0.25d0*(1.d0 - xi)
+      dn_xieta(2,2) = -0.25d0*(1.d0 + xi)
+      dn_xieta(2,3) =  0.25d0*(1.d0 + xi)
+      dn_xieta(2,4) =  0.25d0*(1.d0 - xi)
+	  !print*,'dn_xieta=',dn_xieta
+*     ================================================================================================     *
+      return 
+      end subroutine shapefuc 
+      
+
+*     *************************************************************************************************
+*
+*     B matrix
+*     
+*     *************************************************************************************************
+*        
+      subroutine b_matrix(shN,bd,det_jacb,coords,xi,eta)
+      
+      include 'vaba_param.inc'
+	  integer i,j
+      dimension bd(2,4) 
+      dimension djacb(2,2), dinv_jacb(2,2), coords(2,4)
+      dimension dn_x(4), dn_y(4), dn_xieta(2,4)
+	  real*8 det_jacb,xi,eta
+*     ================================================================================================     *
+      !shape functions 
+      call shapefuc(shN, dn_xieta, xi, eta)
+      print*,'xi=',xi
+	  print*,'eta=',eta      
+      !jacob matrix
+	  do i = 1,2
+	    do j = 1,2
+		  djacb(i,j) = 0.d0
+	    end do
+      end do
+      do i = 1,4
+        djacb(1,1) = djacb(1,1) + dn_xieta(1,i)*coords(1,i)
+	    djacb(1,2) = djacb(1,2) + dn_xieta(1,i)*coords(2,i)
+	    djacb(2,1) = djacb(2,1) + dn_xieta(2,i)*coords(1,i)
+	    djacb(2,2) = djacb(2,2) + dn_xieta(2,i)*coords(2,i) 
+      end do
+      !print*,'djacb=',djacb
+      !print*,'dn_xieta=',dn_xieta		  
+      det_jacb = djacb(1,1)*djacb(2,2) - djacb(1,2)*djacb(2,1)
+	  !print*,'det_jacb=',det_jacb
+	  do i = 1,2
+	    do j = 1,2
+		  dinv_jacb(i,j) = 0.d0
+	    end do
+      end do
+	  dinv_jacb(1,1) = (1.d0 / det_jacb) * djacb(2,2)
+	  dinv_jacb(1,2) = -(1.d0 / det_jacb) * djacb(1,2)
+	  dinv_jacb(2,1) = -(1.d0 / det_jacb) * djacb(2,1)
+	  dinv_jacb(2,2) = (1.d0 / det_jacb) * djacb(1,1)    
+      !print*,'dinv_jacb=',dinv_jacb  
+*     initialize varibles
+	  do i = 1,4
+		dn_x(i) = 0.d0
+		dn_y(i) = 0.d0
+        bd(1,i) = dn_x(i)
+        bd(2,i) = dn_y(i)		
+      end do
+      do i = 1,4
+         dn_x(i) = dinv_jacb(1,1)*dn_xieta(1,i) + dinv_jacb(1,2)*dn_xieta(2,i)
+         dn_y(i) = dinv_jacb(2,1)*dn_xieta(1,i) + dinv_jacb(2,2)*dn_xieta(2,i)
+      end do
+      !print*,'dn_x=',dn_x 
+      !print*,'dn_y=',dn_y 	  
+      !B matrix for damage
+      do j = 1,4
+         bd(1,j) = dn_x(j)
+         bd(2,j) = dn_y(j)
+      end do
+      !print*,'bd=',bd 
+*     ================================================================================================     *
+      return
+      end subroutine b_matrix
+
+      
+      
+c ----------------------------------------------------------------------
+C
+c Convert between voigt notation and tensor form. 
+C it only works for 3D condition. 
+C
+c ----------------------------------------------------------------------
+      subroutine voigt_convection(A_voigt, A, convert2voigt, kinetic)
+      ! Checked.
+      integer i,j
+      real, dimension(3,3):: A
+      real A_voigt(6)
+      logical convert2voigt, kinetic
+
+      if (convert2voigt) then 
+          ! Convect to the voigt notation.
+          A_voigt(:) = 0
+          do i = 1, 3
+              A_voigt(i) = A(i,i)        
+          end do
+
+          if (kinetic) then
+              A_voigt(4) = A(1,2)
+              A_voigt(5) = A(2,3)
+              A_voigt(6) = A(1,3)
+          else  
+              A_voigt(4) = 2.0*A(1,2)
+              A_voigt(5) = 2.0*A(1,3)
+              A_voigt(6) = 2.0*A(2,3)
+          end if
+      else 
+          ! Convect to the tensor form.
+          A(:,:) = 0
+          do i = 1, 3
+                A(i,i) = A_voigt(i)        
+          end do
+          if (kinetic) then
+                A(1,2) =  A_voigt(4) 
+                A(2,3) =  A_voigt(5) 
+                A(1,3) =  A_voigt(6) 
+          else 
+                A(1,2) = 0.5 * A_voigt(4) 
+                A(1,3) = 0.5 * A_voigt(5) 
+                A(2,3) = 0.5 * A_voigt(6) 
+          end if 
+          do i = 1,2
+              do j = i+1,3
+                  A(j,i) = A(i,j)
+              end do
+          end do
+      end if
+      
+      return
+      end subroutine
+      
+      
+      
+c ----------------------------------------------------------------------
+C
+C    eigen3D = determine eigenvalues/vectors for 3x3 symmetric matrix
+C    
+C    arguments description
+C    ---------------------
+C    input:
+C      u(3,3) : matrix with initial values (only upper half used)
+C    
+C    outputs:
+C      d(3) : eigenvalues associated with columns of v
+C      v(3,3) : matrix of the eigenvectors (by column)
+C
+c ----------------------------------------------------------------------
+
+      subroutine eigen3D(u, d, v)
+
+      real, dimension(3,3), intent(in) :: u
+      real, dimension(3), intent(out) :: d
+      real, dimension(3,3) :: v
+      ! ====================================
+      ! local variables
+      ! ==============
+      integer :: rot, its
+      real :: g, h, aij, sm, thresh, t, c, s, tau
+
+      real :: a(3), b(3), z(3)
+
+      ! loop index variable
+      integer :: i, j, k
+      
+      parameter ( zero = 0.d0, one = 1.d0 , two = 2.d0)
+      ! ====================================
+
+      ! initialize
+      d(:)= zero
+      v(:,:)= zero
+
+      ! copy value of u to v
+      v(1:3,1:3)= u(1:3,1:3)
+
+      ! transfer arrays into 1D arrays
+      a(1) = v(1,2)
+      a(2) = v(2,3)
+      a(3) = v(1,3)
+
+      do i = 1, 3
+         d(i) = v(i,i)
+         b(i) = d(i)
+         z(i) = zero
+
+         do j = 1,3
+            v(i,j) = zero
+         end do ! j
+
+         v(i,i) = one
+      end do ! i
+
+      ! check for diagonal case
+      sm = abs(a(1)) + abs(a(2)) + abs(a(3))
+      g  = abs(d(1)) + abs(d(2)) + abs(d(3))
+
+      if (sm .lt. 1.0e-13*g) return
+
+      rot = 0
+      do its = 1, 50
+
+         ! set convergence test and threshold
+         sm = abs(a(1)) + abs(a(2)) + abs(a(3))
+         if ( sm == zero ) return
+
+         if( its < 4 ) then
+            thresh = 0.011d0*sm
+         else
+            thresh = zero
+         end if
+
+         ! perform sweeps for rotation
+         do i = 1, 3
+            j = mod(i,3) + 1
+            k = mod(j,3) + 1
+
+            aij = a(i)
+            g = 100.d0 * abs(aij)
+
+          if((abs(d(i))+g/=abs(d(i))).or.(abs(d(j))+g/=abs(d(j)))) then
+
+               if( abs(aij) > thresh ) then
+
+                  a(i) = zero
+                  h = d(j) - d(i)
+
+                  if( abs(h)+g == abs(h) ) then
+                     t=aij / h
+                  else
+                     t=sign(two,h/aij)/(abs(h/aij)+sqrt(4.0+(h/aij)**2))
+                  end if
+
+                  ! set rotation parameters
+                  c = one/sqrt(one+t*t)
+                  s = t * c
+                  tau = s / (one+c)
+
+                  ! rotate diagonal terms
+                  h = t * aij
+                  z(i) = z(i) - h
+                  z(j) = z(j) + h
+                  d(i) = d(i) - h
+                  d(j) = d(j) + h
+
+                  ! rotate off-diagonal terms
+                  h = a(j)
+                  g = a(k)
+                  a(j) = h + s*(g - h*tau)
+                  a(k) = g - s*(h + g*tau)
+
+                  ! rotate eigenvectors
+                  do k = 1, 3
+                     g = v(k,i)
+                     h = v(k,j)
+                     v(k,i) = g - s*(h + g*tau)
+                     v(k,j) = h + s*(g - h*tau)
+                  end do ! k
+
+                  rot = rot + 1
+
+               end if
+
+            else
+
+               a(i) = zero
+
+            end if
+
+         end do ! i
+
+         ! update diagonal terms
+         do i = 1, 3
+            b(i) = b(i) + z(i)
+            d(i) = b(i)
+            z(i) = zero
+         end do ! i
+
+      end do ! its
+
+      return
+      end subroutine
