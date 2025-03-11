@@ -1,4 +1,4 @@
-! Explicit user subroutine in Abaqus for phase field method    
+    
 C***********************************************************************
 C
 C     Common variable module, which defines some common variables 
